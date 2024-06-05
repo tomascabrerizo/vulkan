@@ -720,13 +720,13 @@ void vulkan_create_command_buffer(VkState *state) {
     }
 }
 
-void recordCommandBuffer(VkState *state, uint32_t image_index) {
+void recordCommandBuffer(VkState *state, VkCommandBuffer command_buffer, uint32_t image_index) {
     VkCommandBufferBeginInfo begin_info = { 0 };
     begin_info.sType                    = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags                    = 0;
     begin_info.pInheritanceInfo         = NULL;
 
-    if(vkBeginCommandBuffer(state->command_buffer, &begin_info) != VK_SUCCESS) {
+    if(vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
         printf("Failed to begin recording command buffer!\n");
         exit(1);
     }
@@ -742,9 +742,9 @@ void recordCommandBuffer(VkState *state, uint32_t image_index) {
     render_pass_info.clearValueCount = 1;
     render_pass_info.pClearValues    = &clear_color;
 
-    vkCmdBeginRenderPass(state->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, state->pipeline);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, state->pipeline);
 
     VkViewport viewport = { 0 };
     viewport.x          = 0.0f;
@@ -753,18 +753,18 @@ void recordCommandBuffer(VkState *state, uint32_t image_index) {
     viewport.height     = (float)state->swapchain_extent.height;
     viewport.minDepth   = 0.0f;
     viewport.maxDepth   = 1.0f;
-    vkCmdSetViewport(state->command_buffer, 0, 1, &viewport);
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
 
     VkRect2D scissor = { 0 };
     scissor.offset   = (VkOffset2D){ 0, 0 };
     scissor.extent   = state->swapchain_extent;
-    vkCmdSetScissor(state->command_buffer, 0, 1, &scissor);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
-    vkCmdDraw(state->command_buffer, 3, 1, 0, 0);
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
-    vkCmdEndRenderPass(state->command_buffer);
+    vkCmdEndRenderPass(command_buffer);
 
-    if(vkEndCommandBuffer(state->command_buffer) != VK_SUCCESS) {
+    if(vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
         printf("Failed to record command buffer!\n");
         exit(1);
     }
@@ -786,6 +786,47 @@ void vulkan_create_sync_objs(VkState *state) {
         printf("Failed to create semaphores!\n");
         exit(1);
     }
+}
+
+void vulkan_draw_frame(VkState *state, VkQueue present_queue, VkQueue graphics_queue) {
+    // Draw Frame
+    vkWaitForFences(state->device, 1, &state->in_flight_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(state->device, 1, &state->in_flight_fence);
+
+    unsigned int image_index = 0;
+    vkAcquireNextImageKHR(state->device, state->swapchain, UINT64_MAX,
+                          state->image_available_semaphore, VK_NULL_HANDLE, &image_index);
+
+    vkResetCommandBuffer(state->command_buffer, 0);
+    recordCommandBuffer(state, state->command_buffer, image_index);
+
+    VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    VkSubmitInfo submit_info           = { 0 };
+    submit_info.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.waitSemaphoreCount     = 1;
+    submit_info.pWaitSemaphores        = &state->image_available_semaphore;
+    submit_info.pWaitDstStageMask      = wait_stages;
+    submit_info.commandBufferCount     = 1;
+    submit_info.pCommandBuffers        = &state->command_buffer;
+    submit_info.signalSemaphoreCount   = 1;
+    submit_info.pSignalSemaphores      = &state->render_finished_semaphore;
+
+    if(vkQueueSubmit(graphics_queue, 1, &submit_info, state->in_flight_fence) != VK_SUCCESS) {
+        printf("Failed to submit draw command buffer!\n");
+        exit(1);
+    }
+
+    VkPresentInfoKHR present_info = { 0 };
+    present_info.sType            = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores    = &state->render_finished_semaphore;
+    present_info.swapchainCount     = 1;
+    present_info.pSwapchains        = &state->swapchain;
+    present_info.pImageIndices      = &image_index;
+    present_info.pResults           = NULL;
+
+    vkQueuePresentKHR(present_queue, &present_info);
 }
 
 int main(void) {
@@ -836,44 +877,7 @@ int main(void) {
             }
         }
 
-        // Draw Frame
-        vkWaitForFences(state.device, 1, &state.in_flight_fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(state.device, 1, &state.in_flight_fence);
-
-        unsigned int image_index = 0;
-        vkAcquireNextImageKHR(state.device, state.swapchain, UINT64_MAX,
-                              state.image_available_semaphore, VK_NULL_HANDLE, &image_index);
-
-        vkResetCommandBuffer(state.command_buffer, 0);
-        recordCommandBuffer(&state, image_index);
-
-        VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-        VkSubmitInfo submit_info           = { 0 };
-        submit_info.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.waitSemaphoreCount     = 1;
-        submit_info.pWaitSemaphores        = &state.image_available_semaphore;
-        submit_info.pWaitDstStageMask      = wait_stages;
-        submit_info.commandBufferCount     = 1;
-        submit_info.pCommandBuffers        = &state.command_buffer;
-        submit_info.signalSemaphoreCount   = 1;
-        submit_info.pSignalSemaphores      = &state.render_finished_semaphore;
-
-        if(vkQueueSubmit(graphics_queue, 1, &submit_info, state.in_flight_fence) != VK_SUCCESS) {
-            printf("Failed to submit draw command buffer!\n");
-            exit(1);
-        }
-
-        VkPresentInfoKHR present_info = { 0 };
-        present_info.sType            = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-
-        present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores    = &state.render_finished_semaphore;
-        present_info.swapchainCount     = 1;
-        present_info.pSwapchains        = &state.swapchain;
-        present_info.pImageIndices      = &image_index;
-        present_info.pResults           = NULL;
-
-        vkQueuePresentKHR(present_queue, &present_info);
+        vulkan_draw_frame(&state, present_queue, graphics_queue);
     }
 
     vkDeviceWaitIdle(state.device);
