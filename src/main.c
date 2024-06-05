@@ -65,6 +65,36 @@ File read_entire_file(Arena *arena, const char *path) {
 const char *validation_layers[] = { "VK_LAYER_KHRONOS_validation" };
 const char *device_extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
 
+typedef struct VkState {
+
+    VkInstance instance;
+    VkSurfaceKHR surface;
+    VkPhysicalDevice physical_device;
+    unsigned int present_queue_index, graphics_queue_index, queue_family_count;
+    VkDevice device;
+
+    VkFormat swapchain_image_format;
+    VkExtent2D swapchain_extent;
+    VkSwapchainKHR swapchain;
+
+    unsigned int swapchain_images_count;
+    VkImageView *swapchain_images_views;
+
+    VkRenderPass render_pass;
+    VkPipeline pipeline;
+
+    VkFramebuffer *framebuffers;
+    unsigned int framebuffers_count;
+
+    VkCommandPool command_pool;
+    VkCommandBuffer command_buffer;
+
+    VkSemaphore image_available_semaphore;
+    VkSemaphore render_finished_semaphore;
+    VkFence in_flight_fence;
+
+} VkState;
+
 void check_device_extensions(VkPhysicalDevice device, Arena *arena, const char **extensions,
                              unsigned extensions_count, bool *extensions_found) {
     *extensions_found = true;
@@ -124,7 +154,7 @@ void check_validation_layers(Arena *arena, const char **validation_layers,
     }
 }
 
-VkInstance vulkan_create_instance(Arena *arena, SDL_Window *window) {
+void vulkan_create_instance(VkState *state, Arena *arena, SDL_Window *window) {
     // Create vulkan instance
     VkApplicationInfo app_info  = { 0 };
     app_info.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -155,39 +185,34 @@ VkInstance vulkan_create_instance(Arena *arena, SDL_Window *window) {
     create_info.enabledLayerCount       = validation_layer_found ? array_len(validation_layers) : 0;
     create_info.ppEnabledLayerNames     = validation_layers;
 
-    VkInstance instace = { 0 };
-    if(vkCreateInstance(&create_info, NULL, &instace) != VK_SUCCESS) {
+    if(vkCreateInstance(&create_info, NULL, &state->instance) != VK_SUCCESS) {
         printf("Fail to create VkInstace\n");
         exit(1);
     }
-
-    return instace;
 }
 
-VkSurfaceKHR vulkan_create_surface(SDL_Window *window, VkInstance instance) {
+void vulkan_create_surface(VkState *state, SDL_Window *window) {
     // Create Window Surface
-    VkSurfaceKHR surface;
-    if(SDL_Vulkan_CreateSurface(window, instance, &surface) == SDL_FALSE) {
+    if(SDL_Vulkan_CreateSurface(window, state->instance, &state->surface) == SDL_FALSE) {
         printf("Fail to create Vulkan surface\n");
         exit(1);
     }
-    return surface;
 }
 
-VkPhysicalDevice vulkan_select_physical_device(Arena *arena, VkInstance instance) {
+void vulkan_select_physical_device(VkState *state, Arena *arena) {
     // Selecting a physical device
     unsigned int device_count = 0;
-    vkEnumeratePhysicalDevices(instance, &device_count, NULL);
+    vkEnumeratePhysicalDevices(state->instance, &device_count, NULL);
     if(device_count == 0) {
         printf("Fail to find GPU with vulkan support\n");
         exit(1);
     }
     VkPhysicalDevice *physical_devices =
         (VkPhysicalDevice *)arena_push(arena, sizeof(VkPhysicalDevice) * device_count);
-    vkEnumeratePhysicalDevices(instance, &device_count, physical_devices);
+    vkEnumeratePhysicalDevices(state->instance, &device_count, physical_devices);
 
     // NOTE: Find suitable device
-    VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+    state->physical_device = VK_NULL_HANDLE;
 
     for(unsigned int device_index = 0; device_index < device_count; ++device_index) {
 
@@ -199,64 +224,61 @@ VkPhysicalDevice vulkan_select_physical_device(Arena *arena, VkInstance instance
 
         if(device_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
            device_feats.geometryShader) {
-            physical_device = device;
+            state->physical_device = device;
             break;
         }
     }
 
-    assert(physical_device != VK_NULL_HANDLE);
-    return physical_device;
+    assert(state->physical_device != VK_NULL_HANDLE);
 }
 
-void vulkan_find_family_queues(Arena *arena, VkPhysicalDevice physical_device, VkSurfaceKHR surface,
-                               unsigned int *graphics_queue_index,
-                               unsigned int *present_queue_index,
-                               unsigned int *queue_family_count) {
+void vulkan_find_family_queues(VkState *state, Arena *arena) {
     // NOTE: Find queue family queues
-    *queue_family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, queue_family_count, NULL);
+    state->queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(state->physical_device, &state->queue_family_count,
+                                             NULL);
     VkQueueFamilyProperties *queue_family_props =
-        arena_push(arena, sizeof(VkQueueFamilyProperties) * *queue_family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, queue_family_count,
+        arena_push(arena, sizeof(VkQueueFamilyProperties) * state->queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(state->physical_device, &state->queue_family_count,
                                              queue_family_props);
-    *graphics_queue_index = (unsigned int)-1;
-    *present_queue_index  = (unsigned int)-1;
+    state->graphics_queue_index = (unsigned int)-1;
+    state->present_queue_index  = (unsigned int)-1;
 
-    for(unsigned int i = 0; i < *queue_family_count; ++i) {
+    for(unsigned int i = 0; i < state->queue_family_count; ++i) {
 
         VkBool32 present_support = false;
-        vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface, &present_support);
+        vkGetPhysicalDeviceSurfaceSupportKHR(state->physical_device, i, state->surface,
+                                             &present_support);
         if(present_support) {
-            *present_queue_index = i;
+            state->present_queue_index = i;
         }
 
         if(queue_family_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            *graphics_queue_index = i;
+            state->graphics_queue_index = i;
         }
 
-        if(*present_queue_index != (unsigned int)-1 && *graphics_queue_index != (unsigned int)-1) {
+        if(state->present_queue_index != (unsigned int)-1 &&
+           state->graphics_queue_index != (unsigned int)-1) {
             break;
         }
     }
 
-    if(*graphics_queue_index == (unsigned int)-1 || *present_queue_index == (unsigned int)-1) {
+    if(state->graphics_queue_index == (unsigned int)-1 ||
+       state->present_queue_index == (unsigned int)-1) {
         printf("Present Queue not supported!\n");
         exit(1);
     }
 }
 
-VkDevice vulkan_create_logical_device(Arena *arena, VkPhysicalDevice physical_device,
-                                      unsigned int present_queue_index,
-                                      unsigned int graphics_queue_index,
-                                      unsigned int queue_family_count) {
+void vulkan_create_logical_device(VkState *state, Arena *arena) {
     float queue_priority = 1.0f;
 
-    unsigned int queue_families[]               = { present_queue_index, graphics_queue_index };
+    unsigned int queue_families[] = { state->present_queue_index, state->graphics_queue_index };
     VkDeviceQueueCreateInfo *queue_create_infos = (VkDeviceQueueCreateInfo *)arena_push(
         arena, sizeof(VkDeviceQueueCreateInfo) * array_len(queue_families));
     unsigned int unique_families_count = 0;
-    bool *unique_families_state        = arena_push(arena, sizeof(bool) * queue_family_count);
-    memset(unique_families_state, 0, sizeof(bool) * queue_family_count);
+    bool *unique_families_state = arena_push(arena, sizeof(bool) * state->queue_family_count);
+    memset(unique_families_state, 0, sizeof(bool) * state->queue_family_count);
 
     for(unsigned int queue_index = 0; queue_index < array_len(queue_families); ++queue_index) {
         if(unique_families_state[queue_families[queue_index]] == false) {
@@ -274,8 +296,8 @@ VkDevice vulkan_create_logical_device(Arena *arena, VkPhysicalDevice physical_de
 
     // Enable device extensions
     bool device_extensions_found = true;
-    check_device_extensions(physical_device, arena, device_extensions, array_len(device_extensions),
-                            &device_extensions_found);
+    check_device_extensions(state->physical_device, arena, device_extensions,
+                            array_len(device_extensions), &device_extensions_found);
 
     bool validation_layer_found = false;
     check_validation_layers(arena, validation_layers, array_len(validation_layers),
@@ -295,37 +317,34 @@ VkDevice vulkan_create_logical_device(Arena *arena, VkPhysicalDevice physical_de
     device_create_info.enabledExtensionCount =
         device_extensions_found ? array_len(device_extensions) : 0;
 
-    VkDevice device;
-    if(vkCreateDevice(physical_device, &device_create_info, NULL, &device) != VK_SUCCESS) {
+    if(vkCreateDevice(state->physical_device, &device_create_info, NULL, &state->device) !=
+       VK_SUCCESS) {
         printf("Failed to create logical device!\n");
         exit(1);
     }
-
-    return device;
 }
 
-VkSwapchainKHR vulkan_create_swapchain(Arena *arena, VkPhysicalDevice physical_device,
-                                       VkDevice device, VkSurfaceKHR surface, SDL_Window *window,
-                                       unsigned int present_queue_index,
-                                       unsigned int graphics_queue_index,
-                                       VkFormat *swapchain_image_format,
-                                       VkExtent2D *swapchain_extent) {
+void vulkan_create_swapchain(VkState *state, Arena *arena, SDL_Window *window) {
     // Query Swapchain support
     VkSurfaceCapabilitiesKHR capabilities = { 0 };
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(state->physical_device, state->surface,
+                                              &capabilities);
 
     unsigned int formats_count = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &formats_count, NULL);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(state->physical_device, state->surface, &formats_count,
+                                         NULL);
     VkSurfaceFormatKHR *formats =
         (VkSurfaceFormatKHR *)arena_push(arena, sizeof(VkSurfaceFormatKHR) * formats_count);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &formats_count, formats);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(state->physical_device, state->surface, &formats_count,
+                                         formats);
 
     unsigned int present_modes_count = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_modes_count, NULL);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(state->physical_device, state->surface,
+                                              &present_modes_count, NULL);
     VkPresentModeKHR *present_modes =
         (VkPresentModeKHR *)arena_push(arena, sizeof(VkPresentModeKHR) * present_modes_count);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_modes_count,
-                                              present_modes);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(state->physical_device, state->surface,
+                                              &present_modes_count, present_modes);
 
     if(formats_count == 0 || present_modes_count == 0) {
         printf("Swap chain not supported\n");
@@ -372,12 +391,12 @@ VkSwapchainKHR vulkan_create_swapchain(Arena *arena, VkPhysicalDevice physical_d
         image_count = capabilities.maxImageCount;
     }
 
-    unsigned int queue_families[] = { present_queue_index, graphics_queue_index };
+    unsigned int queue_families[] = { state->present_queue_index, state->graphics_queue_index };
 
     // Create SwapChain
     VkSwapchainCreateInfoKHR swapchain_create_info = { 0 };
     swapchain_create_info.sType                    = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    swapchain_create_info.surface                  = surface;
+    swapchain_create_info.surface                  = state->surface;
     swapchain_create_info.minImageCount            = image_count;
     swapchain_create_info.imageFormat              = format.format;
     swapchain_create_info.imageColorSpace          = format.colorSpace;
@@ -385,7 +404,7 @@ VkSwapchainKHR vulkan_create_swapchain(Arena *arena, VkPhysicalDevice physical_d
     swapchain_create_info.imageArrayLayers         = 1;
     swapchain_create_info.imageUsage               = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-    if(graphics_queue_index != present_queue_index) {
+    if(state->graphics_queue_index != state->present_queue_index) {
         swapchain_create_info.imageSharingMode      = VK_SHARING_MODE_CONCURRENT;
         swapchain_create_info.queueFamilyIndexCount = 2;
         swapchain_create_info.pQueueFamilyIndices   = queue_families;
@@ -402,38 +421,36 @@ VkSwapchainKHR vulkan_create_swapchain(Arena *arena, VkPhysicalDevice physical_d
     swapchain_create_info.oldSwapchain   = VK_NULL_HANDLE;
 
     VkSwapchainKHR swapchain;
-    if(vkCreateSwapchainKHR(device, &swapchain_create_info, NULL, &swapchain) != VK_SUCCESS) {
+    if(vkCreateSwapchainKHR(state->device, &swapchain_create_info, NULL, &swapchain) !=
+       VK_SUCCESS) {
         printf("Failed to create swap chain!\n");
         exit(1);
     }
 
-    *swapchain_image_format = format.format;
-    *swapchain_extent       = extend;
-
-    return swapchain;
+    state->swapchain_image_format = format.format;
+    state->swapchain_extent       = extend;
+    state->swapchain              = swapchain;
 }
 
-void vulkan_create_images_views(Arena *arena, VkDevice device, VkSwapchainKHR swapchain,
-                                VkFormat swapchain_image_format,
-                                VkImageView **swapchain_images_views,
-                                unsigned int *swapchain_images_count) {
+void vulkan_create_images_views(VkState *state, Arena *arena) {
     // NOTE: Retrive swapchain images
-    *swapchain_images_count = 0;
-    vkGetSwapchainImagesKHR(device, swapchain, swapchain_images_count, NULL);
+    state->swapchain_images_count = 0;
+    vkGetSwapchainImagesKHR(state->device, state->swapchain, &state->swapchain_images_count, NULL);
     VkImage *swapchain_images =
-        (VkImage *)arena_push(arena, sizeof(VkImage) * *swapchain_images_count);
-    vkGetSwapchainImagesKHR(device, swapchain, swapchain_images_count, swapchain_images);
+        (VkImage *)arena_push(arena, sizeof(VkImage) * state->swapchain_images_count);
+    vkGetSwapchainImagesKHR(state->device, state->swapchain, &state->swapchain_images_count,
+                            swapchain_images);
 
-    *swapchain_images_views =
-        (VkImageView *)arena_push(arena, sizeof(VkImageView) * *swapchain_images_count);
+    state->swapchain_images_views =
+        (VkImageView *)arena_push(arena, sizeof(VkImageView) * state->swapchain_images_count);
 
     // Create ImageView
-    for(unsigned int image_index = 0; image_index < *swapchain_images_count; ++image_index) {
+    for(unsigned int image_index = 0; image_index < state->swapchain_images_count; ++image_index) {
         VkImageViewCreateInfo create_info           = { 0 };
         create_info.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         create_info.image                           = swapchain_images[image_index];
         create_info.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
-        create_info.format                          = swapchain_image_format;
+        create_info.format                          = state->swapchain_image_format;
         create_info.components.r                    = VK_COMPONENT_SWIZZLE_IDENTITY;
         create_info.components.g                    = VK_COMPONENT_SWIZZLE_IDENTITY;
         create_info.components.b                    = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -444,8 +461,8 @@ void vulkan_create_images_views(Arena *arena, VkDevice device, VkSwapchainKHR sw
         create_info.subresourceRange.baseArrayLayer = 0;
         create_info.subresourceRange.layerCount     = 1;
 
-        if(vkCreateImageView(device, &create_info, NULL,
-                             &((*swapchain_images_views)[image_index])) != VK_SUCCESS) {
+        if(vkCreateImageView(state->device, &create_info, NULL,
+                             &state->swapchain_images_views[image_index]) != VK_SUCCESS) {
             printf("Failed to create image views!\n");
             exit(1);
         }
@@ -466,9 +483,9 @@ VkShaderModule vulkan_create_shader_module(VkDevice device, File *file) {
     return shader_module;
 }
 
-VkRenderPass vulkan_create_render_pass(VkDevice device, VkFormat swapchain_image_format) {
+void vulkan_create_render_pass(VkState *state) {
     VkAttachmentDescription color_attachment = { 0 };
-    color_attachment.format                  = swapchain_image_format;
+    color_attachment.format                  = state->swapchain_image_format;
     color_attachment.samples                 = VK_SAMPLE_COUNT_1_BIT;
     color_attachment.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color_attachment.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
@@ -494,8 +511,6 @@ VkRenderPass vulkan_create_render_pass(VkDevice device, VkFormat swapchain_image
     dependency.dstStageMask        = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependency.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
-    VkRenderPass render_pass = { 0 };
-
     VkRenderPassCreateInfo render_pass_info = { 0 };
     render_pass_info.sType                  = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     render_pass_info.attachmentCount        = 1;
@@ -505,24 +520,22 @@ VkRenderPass vulkan_create_render_pass(VkDevice device, VkFormat swapchain_image
     render_pass_info.dependencyCount        = 1;
     render_pass_info.pDependencies          = &dependency;
 
-    if(vkCreateRenderPass(device, &render_pass_info, NULL, &render_pass) != VK_SUCCESS) {
+    if(vkCreateRenderPass(state->device, &render_pass_info, NULL, &state->render_pass) !=
+       VK_SUCCESS) {
         printf("Failed to create render pass!\n");
         exit(1);
     }
-
-    return render_pass;
 }
 
-VkPipeline vulkan_create_graphics_pipeline(Arena *arena, VkDevice device,
-                                           VkExtent2D swapchain_extet, VkRenderPass render_pass) {
+void vulkan_create_graphics_pipeline(VkState *state, Arena *arena) {
 
     // Create Graphics pipeline
 
     File vert_code = read_entire_file(arena, "./res/shaders/vert.spv");
     File frag_code = read_entire_file(arena, "./res/shaders/frag.spv");
 
-    VkShaderModule vert_module = vulkan_create_shader_module(device, &vert_code);
-    VkShaderModule frag_module = vulkan_create_shader_module(device, &frag_code);
+    VkShaderModule vert_module = vulkan_create_shader_module(state->device, &vert_code);
+    VkShaderModule frag_module = vulkan_create_shader_module(state->device, &frag_code);
 
     VkPipelineShaderStageCreateInfo vert_shader_stage_info = { 0 };
     vert_shader_stage_info.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -561,14 +574,14 @@ VkPipeline vulkan_create_graphics_pipeline(Arena *arena, VkDevice device,
     VkViewport viewport = { 0 };
     viewport.x          = 0.0f;
     viewport.y          = 0.0f;
-    viewport.width      = (float)swapchain_extet.width;
-    viewport.height     = (float)swapchain_extet.height;
+    viewport.width      = (float)state->swapchain_extent.width;
+    viewport.height     = (float)state->swapchain_extent.height;
     viewport.minDepth   = 0.0f;
     viewport.maxDepth   = 1.0f;
 
     VkRect2D scissor = { 0 };
     scissor.offset   = (VkOffset2D){ 0, 0 };
-    scissor.extent   = swapchain_extet;
+    scissor.extent   = state->swapchain_extent;
 
     VkPipelineViewportStateCreateInfo viewport_state = { 0 };
     viewport_state.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -624,7 +637,7 @@ VkPipeline vulkan_create_graphics_pipeline(Arena *arena, VkDevice device,
     pipeline_layout_info.pushConstantRangeCount     = 0;
     pipeline_layout_info.pPushConstantRanges        = NULL;
 
-    if(vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, &pipeline_layout) !=
+    if(vkCreatePipelineLayout(state->device, &pipeline_layout_info, NULL, &pipeline_layout) !=
        VK_SUCCESS) {
         printf("Failed to create pipeline layout!\n");
         exit(1);
@@ -643,134 +656,121 @@ VkPipeline vulkan_create_graphics_pipeline(Arena *arena, VkDevice device,
     pipeline_info.pColorBlendState             = &color_blending;
     pipeline_info.pDynamicState                = &dynamic_state;
     pipeline_info.layout                       = pipeline_layout;
-    pipeline_info.renderPass                   = render_pass;
+    pipeline_info.renderPass                   = state->render_pass;
     pipeline_info.subpass                      = 0;
     pipeline_info.basePipelineHandle           = VK_NULL_HANDLE;
     pipeline_info.basePipelineIndex            = -1;
 
-    VkPipeline pipeline;
-    if(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipeline) !=
-       VK_SUCCESS) {
+    if(vkCreateGraphicsPipelines(state->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
+                                 &state->pipeline) != VK_SUCCESS) {
         printf("Failed to create graphics pipeline!\n");
         exit(1);
     }
-
-    return pipeline;
 }
 
-void vulkan_create_framebuffer(Arena *arena, VkDevice device, VkImageView *swapchain_images_views,
-                               unsigned int swapchain_images_count, VkRenderPass render_pass,
-                               VkExtent2D swapchain_extent, VkFramebuffer **framebuffers,
-                               unsigned int *framebuffers_count) {
+void vulkan_create_framebuffer(VkState *state, Arena *arena) {
 
-    *framebuffers_count = swapchain_images_count;
-    *framebuffers =
-        (VkFramebuffer *)arena_push(arena, sizeof(VkFramebuffer) * swapchain_images_count);
+    state->framebuffers_count = state->swapchain_images_count;
+    state->framebuffers =
+        (VkFramebuffer *)arena_push(arena, sizeof(VkFramebuffer) * state->swapchain_images_count);
 
-    for(unsigned int image_index = 0; image_index < swapchain_images_count; ++image_index) {
-        VkImageView image_view = swapchain_images_views[image_index];
+    for(unsigned int image_index = 0; image_index < state->swapchain_images_count; ++image_index) {
+        VkImageView image_view = state->swapchain_images_views[image_index];
 
         VkFramebufferCreateInfo framebuffer_info = { 0 };
         framebuffer_info.sType                   = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        framebuffer_info.renderPass              = render_pass;
+        framebuffer_info.renderPass              = state->render_pass;
         framebuffer_info.attachmentCount         = 1;
         framebuffer_info.pAttachments            = &image_view;
-        framebuffer_info.width                   = swapchain_extent.width;
-        framebuffer_info.height                  = swapchain_extent.height;
+        framebuffer_info.width                   = state->swapchain_extent.width;
+        framebuffer_info.height                  = state->swapchain_extent.height;
         framebuffer_info.layers                  = 1;
 
-        if(vkCreateFramebuffer(device, &framebuffer_info, NULL, &((*framebuffers)[image_index])) !=
-           VK_SUCCESS) {
+        if(vkCreateFramebuffer(state->device, &framebuffer_info, NULL,
+                               &state->framebuffers[image_index]) != VK_SUCCESS) {
             printf("Failed to create framebuffer!\n");
             exit(1);
         }
     }
 }
 
-VkCommandPool vulkan_create_command_pool(VkDevice device, unsigned int graphics_queue_index) {
+void vulkan_create_command_pool(VkState *state) {
 
     VkCommandPoolCreateInfo pool_info = { 0 };
     pool_info.sType                   = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags                   = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pool_info.queueFamilyIndex        = graphics_queue_index;
+    pool_info.queueFamilyIndex        = state->graphics_queue_index;
 
-    VkCommandPool command_pool = { 0 };
-    if(vkCreateCommandPool(device, &pool_info, NULL, &command_pool) != VK_SUCCESS) {
+    if(vkCreateCommandPool(state->device, &pool_info, NULL, &state->command_pool) != VK_SUCCESS) {
         printf("Failed to create command pool!\n");
         exit(1);
     }
-    return command_pool;
 }
 
-VkCommandBuffer vulkan_create_command_buffer(VkDevice device, VkCommandPool command_pool) {
+void vulkan_create_command_buffer(VkState *state) {
     VkCommandBufferAllocateInfo alloc_info = { 0 };
     alloc_info.sType                       = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool                 = command_pool;
+    alloc_info.commandPool                 = state->command_pool;
     alloc_info.level                       = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount          = 1;
 
-    VkCommandBuffer command_buffer = { 0 };
-    if(vkAllocateCommandBuffers(device, &alloc_info, &command_buffer) != VK_SUCCESS) {
+    if(vkAllocateCommandBuffers(state->device, &alloc_info, &state->command_buffer) != VK_SUCCESS) {
         printf("Failed to allocate command buffers!\n");
         exit(1);
     }
-    return command_buffer;
 }
 
-void recordCommandBuffer(VkCommandBuffer command_buffer, VkPipeline pipeline,
-                         VkFramebuffer *framebuffers, uint32_t image_index,
-                         VkRenderPass render_pass, VkExtent2D swapchain_extent) {
+void recordCommandBuffer(VkState *state, uint32_t image_index) {
     VkCommandBufferBeginInfo begin_info = { 0 };
     begin_info.sType                    = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags                    = 0;
     begin_info.pInheritanceInfo         = NULL;
 
-    if(vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
+    if(vkBeginCommandBuffer(state->command_buffer, &begin_info) != VK_SUCCESS) {
         printf("Failed to begin recording command buffer!\n");
         exit(1);
     }
 
     VkRenderPassBeginInfo render_pass_info = { 0 };
     render_pass_info.sType                 = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    render_pass_info.renderPass            = render_pass;
-    render_pass_info.framebuffer           = framebuffers[image_index];
+    render_pass_info.renderPass            = state->render_pass;
+    render_pass_info.framebuffer           = state->framebuffers[image_index];
     render_pass_info.renderArea.offset     = (VkOffset2D){ 0, 0 };
-    render_pass_info.renderArea.extent     = swapchain_extent;
+    render_pass_info.renderArea.extent     = state->swapchain_extent;
 
     VkClearValue clear_color         = { { { 0.0f, 0.0f, 0.0f, 1.0f } } };
     render_pass_info.clearValueCount = 1;
     render_pass_info.pClearValues    = &clear_color;
 
-    vkCmdBeginRenderPass(command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(state->command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindPipeline(state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, state->pipeline);
 
     VkViewport viewport = { 0 };
     viewport.x          = 0.0f;
     viewport.y          = 0.0f;
-    viewport.width      = (float)swapchain_extent.width;
-    viewport.height     = (float)swapchain_extent.height;
+    viewport.width      = (float)state->swapchain_extent.width;
+    viewport.height     = (float)state->swapchain_extent.height;
     viewport.minDepth   = 0.0f;
     viewport.maxDepth   = 1.0f;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetViewport(state->command_buffer, 0, 1, &viewport);
 
     VkRect2D scissor = { 0 };
     scissor.offset   = (VkOffset2D){ 0, 0 };
-    scissor.extent   = swapchain_extent;
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+    scissor.extent   = state->swapchain_extent;
+    vkCmdSetScissor(state->command_buffer, 0, 1, &scissor);
 
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    vkCmdDraw(state->command_buffer, 3, 1, 0, 0);
 
-    vkCmdEndRenderPass(command_buffer);
+    vkCmdEndRenderPass(state->command_buffer);
 
-    if(vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+    if(vkEndCommandBuffer(state->command_buffer) != VK_SUCCESS) {
         printf("Failed to record command buffer!\n");
         exit(1);
     }
 }
 
-void vulkan_create_sync_objs(VkDevice device, VkSemaphore *image_available_semaphore,
-                             VkSemaphore *render_finished_semaphore, VkFence *in_flight_fence) {
+void vulkan_create_sync_objs(VkState *state) {
     VkSemaphoreCreateInfo semaphore_info = { 0 };
     semaphore_info.sType                 = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -778,9 +778,11 @@ void vulkan_create_sync_objs(VkDevice device, VkSemaphore *image_available_semap
     fence_info.sType             = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence_info.flags             = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    if(vkCreateSemaphore(device, &semaphore_info, NULL, image_available_semaphore) != VK_SUCCESS ||
-       vkCreateSemaphore(device, &semaphore_info, NULL, render_finished_semaphore) != VK_SUCCESS ||
-       vkCreateFence(device, &fence_info, NULL, in_flight_fence) != VK_SUCCESS) {
+    if(vkCreateSemaphore(state->device, &semaphore_info, NULL, &state->image_available_semaphore) !=
+           VK_SUCCESS ||
+       vkCreateSemaphore(state->device, &semaphore_info, NULL, &state->render_finished_semaphore) !=
+           VK_SUCCESS ||
+       vkCreateFence(state->device, &fence_info, NULL, &state->in_flight_fence) != VK_SUCCESS) {
         printf("Failed to create semaphores!\n");
         exit(1);
     }
@@ -799,51 +801,30 @@ int main(void) {
 
     SDL_Window *window = SDL_CreateWindow("vulkan", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                           w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN);
+    VkState state      = { 0 };
 
-    VkInstance instance              = vulkan_create_instance(&arena, window);
-    VkSurfaceKHR surface             = vulkan_create_surface(window, instance);
-    VkPhysicalDevice physical_device = vulkan_select_physical_device(&arena, instance);
-    unsigned int present_queue_index, graphics_queue_index, queue_family_count;
-    vulkan_find_family_queues(&arena, physical_device, surface, &graphics_queue_index,
-                              &present_queue_index, &queue_family_count);
-    VkDevice device = vulkan_create_logical_device(&arena, physical_device, present_queue_index,
-                                                   graphics_queue_index, queue_family_count);
+    vulkan_create_instance(&state, &arena, window);
+    vulkan_create_surface(&state, window);
+    vulkan_select_physical_device(&state, &arena);
+    vulkan_find_family_queues(&state, &arena);
+    vulkan_create_logical_device(&state, &arena);
+    vulkan_create_swapchain(&state, &arena, window);
+    vulkan_create_images_views(&state, &arena);
+    vulkan_create_render_pass(&state);
+    vulkan_create_graphics_pipeline(&state, &arena);
+    vulkan_create_framebuffer(&state, &arena);
 
-    VkFormat swapchain_image_format = { 0 };
-    VkExtent2D swapchain_extet      = { 0 };
-    VkSwapchainKHR swapchain        = vulkan_create_swapchain(
-        &arena, physical_device, device, surface, window, present_queue_index, graphics_queue_index,
-        &swapchain_image_format, &swapchain_extet);
+    vulkan_create_command_pool(&state);
+    vulkan_create_command_buffer(&state);
+    vulkan_create_sync_objs(&state);
 
-    unsigned int swapchain_images_count = 0;
-    VkImageView *swapchain_images_views = NULL;
-    vulkan_create_images_views(&arena, device, swapchain, swapchain_image_format,
-                               &swapchain_images_views, &swapchain_images_count);
-    VkRenderPass render_pass = vulkan_create_render_pass(device, swapchain_image_format);
-    VkPipeline pipeline =
-        vulkan_create_graphics_pipeline(&arena, device, swapchain_extet, render_pass);
-
-    VkFramebuffer *framebuffers     = NULL;
-    unsigned int framebuffers_count = 0;
-    vulkan_create_framebuffer(&arena, device, swapchain_images_views, swapchain_images_count,
-                              render_pass, swapchain_extet, &framebuffers, &framebuffers_count);
-
-    VkCommandPool command_pool     = vulkan_create_command_pool(device, graphics_queue_index);
-    VkCommandBuffer command_buffer = vulkan_create_command_buffer(device, command_pool);
-
-    VkSemaphore image_available_semaphore;
-    VkSemaphore render_finished_semaphore;
-    VkFence in_flight_fence;
-    vulkan_create_sync_objs(device, &image_available_semaphore, &render_finished_semaphore,
-                            &in_flight_fence);
-
-    printf("frambuffer count: %d\n", framebuffers_count);
+    printf("frambuffer count: %d\n", state.framebuffers_count);
     printf("Total allocated size: %zu\n", arena.used);
 
     // Retrive Graphics queue
     VkQueue present_queue, graphics_queue;
-    vkGetDeviceQueue(device, present_queue_index, 0, &present_queue);
-    vkGetDeviceQueue(device, graphics_queue_index, 0, &graphics_queue);
+    vkGetDeviceQueue(state.device, state.present_queue_index, 0, &present_queue);
+    vkGetDeviceQueue(state.device, state.graphics_queue_index, 0, &graphics_queue);
 
     while(running) {
         SDL_Event e;
@@ -856,29 +837,28 @@ int main(void) {
         }
 
         // Draw Frame
-        vkWaitForFences(device, 1, &in_flight_fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &in_flight_fence);
+        vkWaitForFences(state.device, 1, &state.in_flight_fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(state.device, 1, &state.in_flight_fence);
 
         unsigned int image_index = 0;
-        vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, image_available_semaphore,
-                              VK_NULL_HANDLE, &image_index);
+        vkAcquireNextImageKHR(state.device, state.swapchain, UINT64_MAX,
+                              state.image_available_semaphore, VK_NULL_HANDLE, &image_index);
 
-        vkResetCommandBuffer(command_buffer, 0);
-        recordCommandBuffer(command_buffer, pipeline, framebuffers, image_index, render_pass,
-                            swapchain_extet);
+        vkResetCommandBuffer(state.command_buffer, 0);
+        recordCommandBuffer(&state, image_index);
 
         VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
         VkSubmitInfo submit_info           = { 0 };
         submit_info.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.waitSemaphoreCount     = 1;
-        submit_info.pWaitSemaphores        = &image_available_semaphore;
+        submit_info.pWaitSemaphores        = &state.image_available_semaphore;
         submit_info.pWaitDstStageMask      = wait_stages;
         submit_info.commandBufferCount     = 1;
-        submit_info.pCommandBuffers        = &command_buffer;
+        submit_info.pCommandBuffers        = &state.command_buffer;
         submit_info.signalSemaphoreCount   = 1;
-        submit_info.pSignalSemaphores      = &render_finished_semaphore;
+        submit_info.pSignalSemaphores      = &state.render_finished_semaphore;
 
-        if(vkQueueSubmit(graphics_queue, 1, &submit_info, in_flight_fence) != VK_SUCCESS) {
+        if(vkQueueSubmit(graphics_queue, 1, &submit_info, state.in_flight_fence) != VK_SUCCESS) {
             printf("Failed to submit draw command buffer!\n");
             exit(1);
         }
@@ -887,14 +867,16 @@ int main(void) {
         present_info.sType            = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 
         present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores    = &render_finished_semaphore;
+        present_info.pWaitSemaphores    = &state.render_finished_semaphore;
         present_info.swapchainCount     = 1;
-        present_info.pSwapchains        = &swapchain;
+        present_info.pSwapchains        = &state.swapchain;
         present_info.pImageIndices      = &image_index;
         present_info.pResults           = NULL;
 
         vkQueuePresentKHR(present_queue, &present_info);
     }
+
+    vkDeviceWaitIdle(state.device);
 
     return 0;
 }
