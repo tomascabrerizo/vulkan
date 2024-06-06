@@ -10,12 +10,47 @@
 #include <vulkan/vulkan.h>
 
 #define array_len(v) (sizeof((v)) / sizeof((v)[0]))
+#define is_power_of_two(expr) (((expr) & (expr - 1)) == 0)
 #define unused(v) ((void)(v))
+
 #define kb(x) ((x) * 1024ll)
 #define mb(x) (kb(x) * 1024ll)
 #define gb(x) (mb(x) * 1024ll)
 
 #define clamp(a, b, c) max(min(a, c), b)
+
+typedef union V2 {
+    struct {
+        float x, y;
+    };
+    float m[2];
+} V2;
+
+inline V2 v2(float x, float y) {
+    return (V2){ x, y };
+}
+
+typedef union V3 {
+    struct {
+        float x, y, z;
+    };
+    struct {
+        float r, g, b;
+    };
+    float m[3];
+} V3;
+
+inline V3 v3(float x, float y, float z) {
+    return (V3){ x, y, z };
+}
+
+typedef struct Vertex {
+    V2 pos;
+    V3 color;
+} Vertex;
+
+#define VERTEX_LOC_POS 0
+#define VERTEX_LOC_COL 1
 
 typedef struct Arena {
     void *data;
@@ -31,10 +66,16 @@ Arena arena_create(size_t size) {
     return arena;
 }
 
-void *arena_push(Arena *arena, size_t size) {
-    assert(arena->used + size <= arena->size);
-    unsigned char *result = (unsigned char *)arena->data + arena->used;
-    arena->used += size;
+void *arena_push(Arena *arena, size_t size, size_t align) {
+    assert(is_power_of_two(align));
+    uintptr_t unaligned_addr = (uintptr_t)arena->data + arena->used;
+    uintptr_t aligned_addr   = (unaligned_addr + (align - 1)) & ~(align - 1);
+    assert(aligned_addr % align == 0);
+    size_t current_used = (aligned_addr - (uintptr_t)arena->data);
+    size_t total_used   = current_used + size;
+    assert(total_used <= arena->size);
+    arena->used  = total_used;
+    void *result = (void *)aligned_addr;
     memset(result, 0, size);
     return result;
 }
@@ -54,7 +95,7 @@ File read_entire_file(Arena *arena, const char *path) {
     fseek(file, 0, SEEK_END);
     unsigned int size = ftell(file);
     fseek(file, 0, SEEK_SET);
-    result.data = arena_push(arena, size + 1);
+    result.data = arena_push(arena, size + 1, 1);
     result.size = size;
     fread(result.data, result.size, 1, file);
     ((unsigned char *)result.data)[result.size] = '\0';
@@ -65,6 +106,32 @@ File read_entire_file(Arena *arena, const char *path) {
 #define MAX_FRAMES_IN_FLIGHT 2
 const char *validation_layers[] = { "VK_LAYER_KHRONOS_validation" };
 const char *device_extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+const Vertex vertices[] = {
+    {{ 0.0f, -0.5f }, { 1.0f, 0.0f, 0.0f }},
+    { { 0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f }},
+    {{ -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f }}
+};
+
+static inline VkVertexInputBindingDescription vertex_get_binding_description(void) {
+    VkVertexInputBindingDescription bindingDescription = { 0 };
+    bindingDescription.binding                         = 0;
+    bindingDescription.stride                          = sizeof(Vertex);
+    bindingDescription.inputRate                       = VK_VERTEX_INPUT_RATE_VERTEX;
+    return bindingDescription;
+}
+
+static inline void vertex_get_attribute_desc(VkVertexInputAttributeDescription *attr_desc) {
+    attr_desc[VERTEX_LOC_POS].binding  = 0;
+    attr_desc[VERTEX_LOC_POS].location = 0;
+    attr_desc[VERTEX_LOC_POS].format   = VK_FORMAT_R32G32_SFLOAT;
+    attr_desc[VERTEX_LOC_POS].offset   = offsetof(Vertex, pos);
+
+    attr_desc[VERTEX_LOC_COL].binding  = 0;
+    attr_desc[VERTEX_LOC_COL].location = 1;
+    attr_desc[VERTEX_LOC_COL].format   = VK_FORMAT_R32G32B32_SFLOAT;
+    attr_desc[VERTEX_LOC_COL].offset   = offsetof(Vertex, color);
+}
 
 typedef struct VkState {
 
@@ -97,6 +164,9 @@ typedef struct VkState {
     unsigned int current_frame;
     bool framebuffer_resized;
 
+    VkBuffer vertex_buffer;
+    VkDeviceMemory vertex_buffer_memory;
+
 } VkState;
 
 void check_device_extensions(VkPhysicalDevice device, Arena *arena, const char **extensions,
@@ -106,7 +176,7 @@ void check_device_extensions(VkPhysicalDevice device, Arena *arena, const char *
     unsigned int device_extension_count = 0;
     vkEnumerateDeviceExtensionProperties(device, NULL, &device_extension_count, NULL);
     VkExtensionProperties *device_extension_props = (VkExtensionProperties *)arena_push(
-        arena, sizeof(VkExtensionProperties) * device_extension_count);
+        arena, sizeof(VkExtensionProperties) * device_extension_count, 1);
     vkEnumerateDeviceExtensionProperties(device, NULL, &device_extension_count,
                                          device_extension_props);
 
@@ -136,7 +206,7 @@ void check_validation_layers(Arena *arena, const char **validation_layers,
     unsigned int layers_count = 0;
     vkEnumerateInstanceLayerProperties(&layers_count, NULL);
     VkLayerProperties *layers_props =
-        (VkLayerProperties *)arena_push(arena, sizeof(VkLayerProperties) * layers_count);
+        (VkLayerProperties *)arena_push(arena, sizeof(VkLayerProperties) * layers_count, 1);
     vkEnumerateInstanceLayerProperties(&layers_count, layers_props);
     for(unsigned int validation_layer_index = 0; validation_layer_index < validtion_layers_count;
         ++validation_layer_index) {
@@ -173,7 +243,7 @@ void vulkan_create_instance(VkState *state, Arena *arena, SDL_Window *window) {
     unsigned int instance_extensions_count = 0;
     SDL_Vulkan_GetInstanceExtensions(window, &instance_extensions_count, NULL);
     const char **instance_extensions_names =
-        (const char **)arena_push(arena, instance_extensions_count * sizeof(const char **));
+        (const char **)arena_push(arena, instance_extensions_count * sizeof(const char **), 1);
     SDL_Vulkan_GetInstanceExtensions(window, &instance_extensions_count, instance_extensions_names);
 
     // NOTE: Setup Validation layers
@@ -212,7 +282,7 @@ void vulkan_select_physical_device(VkState *state, Arena *arena) {
         exit(1);
     }
     VkPhysicalDevice *physical_devices =
-        (VkPhysicalDevice *)arena_push(arena, sizeof(VkPhysicalDevice) * device_count);
+        (VkPhysicalDevice *)arena_push(arena, sizeof(VkPhysicalDevice) * device_count, 1);
     vkEnumeratePhysicalDevices(state->instance, &device_count, physical_devices);
 
     // NOTE: Find suitable device
@@ -242,7 +312,7 @@ void vulkan_find_family_queues(VkState *state, Arena *arena) {
     vkGetPhysicalDeviceQueueFamilyProperties(state->physical_device, &state->queue_family_count,
                                              NULL);
     VkQueueFamilyProperties *queue_family_props =
-        arena_push(arena, sizeof(VkQueueFamilyProperties) * state->queue_family_count);
+        arena_push(arena, sizeof(VkQueueFamilyProperties) * state->queue_family_count, 1);
     vkGetPhysicalDeviceQueueFamilyProperties(state->physical_device, &state->queue_family_count,
                                              queue_family_props);
     state->graphics_queue_index = (unsigned int)-1;
@@ -279,9 +349,9 @@ void vulkan_create_logical_device(VkState *state, Arena *arena) {
 
     unsigned int queue_families[] = { state->present_queue_index, state->graphics_queue_index };
     VkDeviceQueueCreateInfo *queue_create_infos = (VkDeviceQueueCreateInfo *)arena_push(
-        arena, sizeof(VkDeviceQueueCreateInfo) * array_len(queue_families));
+        arena, sizeof(VkDeviceQueueCreateInfo) * array_len(queue_families), 1);
     unsigned int unique_families_count = 0;
-    bool *unique_families_state = arena_push(arena, sizeof(bool) * state->queue_family_count);
+    bool *unique_families_state = arena_push(arena, sizeof(bool) * state->queue_family_count, 1);
     memset(unique_families_state, 0, sizeof(bool) * state->queue_family_count);
 
     for(unsigned int queue_index = 0; queue_index < array_len(queue_families); ++queue_index) {
@@ -338,7 +408,7 @@ void vulkan_create_swapchain(VkState *state, Arena *arena, SDL_Window *window) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(state->physical_device, state->surface, &formats_count,
                                          NULL);
     VkSurfaceFormatKHR *formats =
-        (VkSurfaceFormatKHR *)arena_push(arena, sizeof(VkSurfaceFormatKHR) * formats_count);
+        (VkSurfaceFormatKHR *)arena_push(arena, sizeof(VkSurfaceFormatKHR) * formats_count, 1);
     vkGetPhysicalDeviceSurfaceFormatsKHR(state->physical_device, state->surface, &formats_count,
                                          formats);
 
@@ -346,7 +416,7 @@ void vulkan_create_swapchain(VkState *state, Arena *arena, SDL_Window *window) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(state->physical_device, state->surface,
                                               &present_modes_count, NULL);
     VkPresentModeKHR *present_modes =
-        (VkPresentModeKHR *)arena_push(arena, sizeof(VkPresentModeKHR) * present_modes_count);
+        (VkPresentModeKHR *)arena_push(arena, sizeof(VkPresentModeKHR) * present_modes_count, 1);
     vkGetPhysicalDeviceSurfacePresentModesKHR(state->physical_device, state->surface,
                                               &present_modes_count, present_modes);
 
@@ -441,12 +511,12 @@ void vulkan_create_images_views(VkState *state, Arena *arena) {
     state->swapchain_images_count = 0;
     vkGetSwapchainImagesKHR(state->device, state->swapchain, &state->swapchain_images_count, NULL);
     VkImage *swapchain_images =
-        (VkImage *)arena_push(arena, sizeof(VkImage) * state->swapchain_images_count);
+        (VkImage *)arena_push(arena, sizeof(VkImage) * state->swapchain_images_count, 1);
     vkGetSwapchainImagesKHR(state->device, state->swapchain, &state->swapchain_images_count,
                             swapchain_images);
 
     state->swapchain_images_views =
-        (VkImageView *)arena_push(arena, sizeof(VkImageView) * state->swapchain_images_count);
+        (VkImageView *)arena_push(arena, sizeof(VkImageView) * state->swapchain_images_count, 1);
 
     // Create ImageView
     for(unsigned int image_index = 0; image_index < state->swapchain_images_count; ++image_index) {
@@ -563,12 +633,16 @@ void vulkan_create_graphics_pipeline(VkState *state, Arena *arena) {
     dynamic_state.dynamicStateCount = array_len(dynamic_states);
     dynamic_state.pDynamicStates    = dynamic_states;
 
+    VkVertexInputBindingDescription vertex_input_desc = vertex_get_binding_description();
+    VkVertexInputAttributeDescription vertex_attr_desc[2];
+    vertex_get_attribute_desc(vertex_attr_desc);
+
     VkPipelineVertexInputStateCreateInfo vertex_input_info = { 0 };
     vertex_input_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertex_input_info.vertexBindingDescriptionCount   = 0;
-    vertex_input_info.pVertexBindingDescriptions      = NULL;
-    vertex_input_info.vertexAttributeDescriptionCount = 0;
-    vertex_input_info.pVertexAttributeDescriptions    = NULL;
+    vertex_input_info.vertexBindingDescriptionCount   = 1;
+    vertex_input_info.pVertexBindingDescriptions      = &vertex_input_desc;
+    vertex_input_info.vertexAttributeDescriptionCount = array_len(vertex_attr_desc);
+    vertex_input_info.pVertexAttributeDescriptions    = vertex_attr_desc;
 
     VkPipelineInputAssemblyStateCreateInfo input_assembly = { 0 };
     input_assembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -675,8 +749,8 @@ void vulkan_create_graphics_pipeline(VkState *state, Arena *arena) {
 void vulkan_create_framebuffer(VkState *state, Arena *arena) {
 
     state->framebuffers_count = state->swapchain_images_count;
-    state->framebuffers =
-        (VkFramebuffer *)arena_push(arena, sizeof(VkFramebuffer) * state->swapchain_images_count);
+    state->framebuffers       = (VkFramebuffer *)arena_push(
+        arena, sizeof(VkFramebuffer) * state->swapchain_images_count, 1);
 
     for(unsigned int image_index = 0; image_index < state->swapchain_images_count; ++image_index) {
         VkImageView image_view = state->swapchain_images_views[image_index];
@@ -792,7 +866,10 @@ void recordCommandBuffer(VkState *state, VkCommandBuffer command_buffer, uint32_
     scissor.extent   = state->swapchain_extent;
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    VkDeviceSize offsets[] = { 0 };
+    vkCmdBindVertexBuffers(command_buffer, 0, 1, &state->vertex_buffer, offsets);
+
+    vkCmdDraw(command_buffer, array_len(vertices), 1, 0, 0);
 
     vkCmdEndRenderPass(command_buffer);
 
@@ -891,6 +968,57 @@ void vulkan_draw_frame(VkState *state, Arena *arena, SDL_Window *window, VkQueue
     }
 }
 
+unsigned int find_memory_type(VkPhysicalDevice physical_device, uint32_t filter,
+                              VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties mem_properties;
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
+    for(uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
+        if((filter & (1 << i)) &&
+           (mem_properties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+
+    printf("Failed to find suitable memory type!\n");
+    exit(1);
+}
+
+void vulkan_create_vertex_buffer(VkState *state) {
+    VkBufferCreateInfo buffer_info = { 0 };
+    buffer_info.sType              = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size               = sizeof(vertices);
+    buffer_info.usage              = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    buffer_info.sharingMode        = VK_SHARING_MODE_EXCLUSIVE;
+
+    if(vkCreateBuffer(state->device, &buffer_info, NULL, &state->vertex_buffer) != VK_SUCCESS) {
+        printf("Failed to create vertex buffer!\n");
+        exit(1);
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetBufferMemoryRequirements(state->device, state->vertex_buffer, &mem_req);
+
+    VkMemoryAllocateInfo alloc_info = { 0 };
+    alloc_info.sType                = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize       = mem_req.size;
+    alloc_info.memoryTypeIndex = find_memory_type(state->physical_device, mem_req.memoryTypeBits,
+                                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if(vkAllocateMemory(state->device, &alloc_info, NULL, &state->vertex_buffer_memory) !=
+       VK_SUCCESS) {
+        printf("Failed to allocate vertex buffer memory!\n");
+        exit(1);
+    }
+
+    vkBindBufferMemory(state->device, state->vertex_buffer, state->vertex_buffer_memory, 0);
+
+    void *data;
+    vkMapMemory(state->device, state->vertex_buffer_memory, 0, buffer_info.size, 0, &data);
+    memcpy(data, vertices, buffer_info.size);
+    vkUnmapMemory(state->device, state->vertex_buffer_memory);
+}
+
 int main(void) {
 
     // Application Setup
@@ -921,6 +1049,8 @@ int main(void) {
     vulkan_create_command_pool(&state);
     vulkan_create_command_buffer(&state);
     vulkan_create_sync_objs(&state);
+
+    vulkan_create_vertex_buffer(&state);
 
     printf("frambuffer count: %d\n", state.framebuffers_count);
     printf("Total allocated size: %zu\n", arena.used);
