@@ -31,11 +31,11 @@ Arena arena_create(size_t size) {
     return arena;
 }
 
-// TODO: Push align memory to the arena
 void *arena_push(Arena *arena, size_t size) {
     assert(arena->used + size <= arena->size);
     unsigned char *result = (unsigned char *)arena->data + arena->used;
     arena->used += size;
+    memset(result, 0, size);
     return result;
 }
 
@@ -62,6 +62,7 @@ File read_entire_file(Arena *arena, const char *path) {
     return result;
 }
 
+#define MAX_FRAMES_IN_FLIGHT 2
 const char *validation_layers[] = { "VK_LAYER_KHRONOS_validation" };
 const char *device_extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
 
@@ -87,11 +88,14 @@ typedef struct VkState {
     unsigned int framebuffers_count;
 
     VkCommandPool command_pool;
-    VkCommandBuffer command_buffer;
+    VkCommandBuffer command_buffers[MAX_FRAMES_IN_FLIGHT];
 
-    VkSemaphore image_available_semaphore;
-    VkSemaphore render_finished_semaphore;
-    VkFence in_flight_fence;
+    VkSemaphore image_available_semaphores[MAX_FRAMES_IN_FLIGHT];
+    VkSemaphore render_finished_semaphores[MAX_FRAMES_IN_FLIGHT];
+    VkFence in_flight_fences[MAX_FRAMES_IN_FLIGHT];
+
+    unsigned int current_frame;
+    bool framebuffer_resized;
 
 } VkState;
 
@@ -694,6 +698,34 @@ void vulkan_create_framebuffer(VkState *state, Arena *arena) {
     }
 }
 
+void vulkan_cleanup_swapchain(VkState *state) {
+    for(unsigned int buffer_index = 0; buffer_index < state->framebuffers_count; ++buffer_index) {
+        vkDestroyFramebuffer(state->device, state->framebuffers[buffer_index], NULL);
+    }
+
+    for(unsigned int image_index = 0; image_index < state->swapchain_images_count; ++image_index) {
+        vkDestroyImageView(state->device, state->swapchain_images_views[image_index], NULL);
+    }
+
+    vkDestroySwapchainKHR(state->device, state->swapchain, NULL);
+}
+
+void vulkan_recreate_swapchain(VkState *state, Arena *arena, SDL_Window *window) {
+
+    while(SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
+        SDL_Event e;
+        SDL_WaitEvent(&e);
+    }
+
+    vkDeviceWaitIdle(state->device);
+
+    vulkan_cleanup_swapchain(state);
+
+    vulkan_create_swapchain(state, arena, window);
+    vulkan_create_images_views(state, arena);
+    vulkan_create_framebuffer(state, arena);
+}
+
 void vulkan_create_command_pool(VkState *state) {
 
     VkCommandPoolCreateInfo pool_info = { 0 };
@@ -712,9 +744,9 @@ void vulkan_create_command_buffer(VkState *state) {
     alloc_info.sType                       = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.commandPool                 = state->command_pool;
     alloc_info.level                       = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount          = 1;
+    alloc_info.commandBufferCount          = array_len(state->command_buffers);
 
-    if(vkAllocateCommandBuffers(state->device, &alloc_info, &state->command_buffer) != VK_SUCCESS) {
+    if(vkAllocateCommandBuffers(state->device, &alloc_info, state->command_buffers) != VK_SUCCESS) {
         printf("Failed to allocate command buffers!\n");
         exit(1);
     }
@@ -778,40 +810,60 @@ void vulkan_create_sync_objs(VkState *state) {
     fence_info.sType             = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence_info.flags             = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    if(vkCreateSemaphore(state->device, &semaphore_info, NULL, &state->image_available_semaphore) !=
-           VK_SUCCESS ||
-       vkCreateSemaphore(state->device, &semaphore_info, NULL, &state->render_finished_semaphore) !=
-           VK_SUCCESS ||
-       vkCreateFence(state->device, &fence_info, NULL, &state->in_flight_fence) != VK_SUCCESS) {
-        printf("Failed to create semaphores!\n");
-        exit(1);
+    for(unsigned int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if(vkCreateSemaphore(state->device, &semaphore_info, NULL,
+                             &state->image_available_semaphores[i]) != VK_SUCCESS ||
+           vkCreateSemaphore(state->device, &semaphore_info, NULL,
+                             &state->render_finished_semaphores[i]) != VK_SUCCESS ||
+           vkCreateFence(state->device, &fence_info, NULL, &state->in_flight_fences[i]) !=
+               VK_SUCCESS) {
+            printf("Failed to create semaphores!\n");
+            exit(1);
+        }
     }
 }
 
-void vulkan_draw_frame(VkState *state, VkQueue present_queue, VkQueue graphics_queue) {
+void vulkan_draw_frame(VkState *state, Arena *arena, SDL_Window *window, VkQueue present_queue,
+                       VkQueue graphics_queue) {
+
+    VkCommandBuffer command_buffer        = state->command_buffers[state->current_frame];
+    VkFence in_flight_fence               = state->in_flight_fences[state->current_frame];
+    VkSemaphore image_available_semaphore = state->image_available_semaphores[state->current_frame];
+    VkSemaphore render_finished_semaphore = state->render_finished_semaphores[state->current_frame];
+
+    state->current_frame = (state->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
     // Draw Frame
-    vkWaitForFences(state->device, 1, &state->in_flight_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(state->device, 1, &state->in_flight_fence);
+    vkWaitForFences(state->device, 1, &in_flight_fence, VK_TRUE, UINT64_MAX);
 
     unsigned int image_index = 0;
-    vkAcquireNextImageKHR(state->device, state->swapchain, UINT64_MAX,
-                          state->image_available_semaphore, VK_NULL_HANDLE, &image_index);
+    VkResult result =
+        vkAcquireNextImageKHR(state->device, state->swapchain, UINT64_MAX,
+                              image_available_semaphore, VK_NULL_HANDLE, &image_index);
+    if(result == VK_ERROR_OUT_OF_DATE_KHR) {
+        vulkan_recreate_swapchain(state, arena, window);
+        return;
+    } else if((result != VK_SUCCESS) && (result != VK_SUBOPTIMAL_KHR)) {
+        printf("Failed to acquire swap chain image!\n");
+        exit(1);
+    }
+    vkResetFences(state->device, 1, &in_flight_fence);
 
-    vkResetCommandBuffer(state->command_buffer, 0);
-    recordCommandBuffer(state, state->command_buffer, image_index);
+    vkResetCommandBuffer(command_buffer, 0);
+    recordCommandBuffer(state, command_buffer, image_index);
 
     VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
     VkSubmitInfo submit_info           = { 0 };
     submit_info.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.waitSemaphoreCount     = 1;
-    submit_info.pWaitSemaphores        = &state->image_available_semaphore;
+    submit_info.pWaitSemaphores        = &image_available_semaphore;
     submit_info.pWaitDstStageMask      = wait_stages;
     submit_info.commandBufferCount     = 1;
-    submit_info.pCommandBuffers        = &state->command_buffer;
+    submit_info.pCommandBuffers        = &command_buffer;
     submit_info.signalSemaphoreCount   = 1;
-    submit_info.pSignalSemaphores      = &state->render_finished_semaphore;
+    submit_info.pSignalSemaphores      = &render_finished_semaphore;
 
-    if(vkQueueSubmit(graphics_queue, 1, &submit_info, state->in_flight_fence) != VK_SUCCESS) {
+    if(vkQueueSubmit(graphics_queue, 1, &submit_info, in_flight_fence) != VK_SUCCESS) {
         printf("Failed to submit draw command buffer!\n");
         exit(1);
     }
@@ -820,13 +872,23 @@ void vulkan_draw_frame(VkState *state, VkQueue present_queue, VkQueue graphics_q
     present_info.sType            = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 
     present_info.waitSemaphoreCount = 1;
-    present_info.pWaitSemaphores    = &state->render_finished_semaphore;
+    present_info.pWaitSemaphores    = &render_finished_semaphore;
     present_info.swapchainCount     = 1;
     present_info.pSwapchains        = &state->swapchain;
     present_info.pImageIndices      = &image_index;
     present_info.pResults           = NULL;
 
-    vkQueuePresentKHR(present_queue, &present_info);
+    result = vkQueuePresentKHR(present_queue, &present_info);
+
+    if(result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
+       state->framebuffer_resized) {
+        state->framebuffer_resized = false;
+        vulkan_recreate_swapchain(state, arena, window);
+        return;
+    } else if(result != VK_SUCCESS) {
+        printf("Failed to present swap chain image!\n");
+        exit(1);
+    }
 }
 
 int main(void) {
@@ -840,9 +902,10 @@ int main(void) {
     int h        = 1080 / 2;
     bool running = true;
 
-    SDL_Window *window = SDL_CreateWindow("vulkan", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                          w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN);
-    VkState state      = { 0 };
+    SDL_Window *window = SDL_CreateWindow(
+        "vulkan (hello, triangle!)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h,
+        SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    VkState state = { 0 };
 
     vulkan_create_instance(&state, &arena, window);
     vulkan_create_surface(&state, window);
@@ -868,16 +931,27 @@ int main(void) {
     vkGetDeviceQueue(state.device, state.graphics_queue_index, 0, &graphics_queue);
 
     while(running) {
+
+        arena_clear(&arena);
+
         SDL_Event e;
         while(SDL_PollEvent(&e)) {
             switch(e.type) {
             case SDL_QUIT: {
                 running = false;
             } break;
+            case SDL_WINDOWEVENT: {
+                if(e.window.event == SDL_WINDOWEVENT_RESIZED) {
+                    state.framebuffer_resized = true;
+                }
+                if(e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    state.framebuffer_resized = true;
+                }
+            }
             }
         }
 
-        vulkan_draw_frame(&state, present_queue, graphics_queue);
+        vulkan_draw_frame(&state, &arena, window, present_queue, graphics_queue);
     }
 
     vkDeviceWaitIdle(state.device);
